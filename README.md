@@ -1,2 +1,0 @@
-# AWS-Labs
-AWS Labs
