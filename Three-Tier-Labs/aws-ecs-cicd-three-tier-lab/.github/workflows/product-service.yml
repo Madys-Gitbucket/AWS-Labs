@@ -1,0 +1,125 @@
+name: product-service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/product-service/**'
+      - '.github/workflows/product-service.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/product-service/**'
+      - '.github/workflows/product-service.yml'
+
+jobs:
+  ci:
+    name: CI — build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: corretto
+          cache: maven
+
+      - name: Compile
+        run: mvn --batch-mode compile
+        working-directory: services/product-service
+
+      - name: Unit tests
+        run: mvn --batch-mode test
+        working-directory: services/product-service
+
+      - name: Package JAR
+        run: mvn --batch-mode package -DskipTests
+        working-directory: services/product-service
+
+      - name: Build Docker image (CI verify)
+        run: |
+          docker build --platform linux/amd64 \
+            -t product-service:ci-${{ github.sha }} \
+            services/product-service/
+
+  cd:
+    name: CD — push and deploy
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write   # required for OIDC
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: corretto
+          cache: maven
+
+      - name: Package JAR
+        run: mvn --batch-mode package -DskipTests
+        working-directory: services/product-service
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-west-2
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --platform linux/amd64 \
+            -t $REGISTRY/lab-product-service:$IMAGE_TAG \
+            -t $REGISTRY/lab-product-service:latest \
+            services/product-service/
+          docker push $REGISTRY/lab-product-service:$IMAGE_TAG
+          docker push $REGISTRY/lab-product-service:latest
+          echo "image=$REGISTRY/lab-product-service:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        id: build
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition lab-product-service \
+            --query taskDefinition \
+            --output json > task-def.json
+
+      - name: Render new task definition with updated image
+        id: render-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: product-service
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task.outputs.task-definition }}
+          service: lab-product-service
+          cluster: lab-cluster
+          wait-for-service-stability: true
+
+      - name: Smoke test
+        run: |
+          sleep 10
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.ALB_URL }}/actuator/health")
+          echo "Health check status: $HTTP_STATUS"
+          [ "$HTTP_STATUS" = "200" ] || exit 1
